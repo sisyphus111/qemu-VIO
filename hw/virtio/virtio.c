@@ -1571,6 +1571,26 @@ int virtqueue_avail_bytes(VirtQueue *vq, unsigned int in_bytes,
     return in_bytes <= in_total && out_bytes <= out_total;
 }
 
+/*
+ * virtqueue_map_desc - 将一个 Guest 物理内存区域映射到 Host 的 iovec 结构中
+ *
+ * 这个函数是 virtio 后端实现模拟 DMA 的核心。它接收一个 Guest 物理地址（GPA）和长度，
+ * 然后调用 DMA 内存映射函数，将其转换为 Host 虚拟地址（HVA），
+ * 并将结果填充到一个 iovec 结构体中，供 Host 直接访问。
+ *
+ * @vdev: VirtIODevice 设备实例。
+ * @p_num_sg: 输入/输出参数，指向 iov 数组中当前 scatter-gather 元素的数量。
+ * @addr: (未使用) 似乎是一个遗留或未完全实现的参数。
+ * @iov: 指向 iovec 数组，用于存储映射结果。
+ * @max_num_sg: iov 数组的最大容量。
+ * @is_write: 标志位，指示 DMA 的方向。
+ *            - true:  Host 写入 Guest (FROM_DEVICE, RX 路径)
+ *            - false: Host 读取 Guest (TO_DEVICE, TX 路径)
+ * @pa: 要映射的 Guest 物理地址 (GPA)。
+ * @sz: 要映射的内存区域大小。
+ *
+ * @return: 成功返回 true，失败返回 false。
+ */
 static bool virtqueue_map_desc(VirtIODevice *vdev, unsigned int *p_num_sg,
                                hwaddr *addr, struct iovec *iov,
                                unsigned int max_num_sg, bool is_write,
@@ -1689,6 +1709,18 @@ static void *virtqueue_alloc_element(size_t sz, unsigned out_num, unsigned in_nu
     return elem;
 }
 
+/*
+ * virtqueue_split_pop - 从 split virtqueue 中弹出一个可用的描述符链
+ *
+ * 这个函数实现了从 "split" (分离式) virtqueue 的可用环 (avail ring) 中获取一个描述符链，
+ * 并将其内容映射到 `elem` 参数中，以便 Host 访问。
+ * 它会处理直接描述符和间接描述符两种情况。
+ *
+ * @vq: 指向要操作的 VirtQueue。
+ * @sz: VirtQueueElement 的大小，包含了 iovec 数组的预留空间。
+ *
+ * @return: 成功则返回一个填充好的 VirtQueueElement 指针，如果队列中没有可用的描述符，则返回 NULL。
+ */
 static void *virtqueue_split_pop(VirtQueue *vq, size_t sz)
 {
     unsigned int i, head, max, idx;
@@ -1707,31 +1739,37 @@ static void *virtqueue_split_pop(VirtQueue *vq, size_t sz)
     address_space_cache_init_empty(&indirect_desc_cache);
 
     RCU_READ_LOCK_GUARD();
+    // 检查 Guest 是否有新的可用描述符放入了可用环。
     if (virtio_queue_empty_rcu(vq)) {
-        goto done;
+        goto done; // 没有可用的描述符
     }
     /* Needed after virtio_queue_empty(), see comment in
      * virtqueue_num_heads(). */
     smp_rmb();
 
     /* When we start there are none of either input nor output. */
+    // 初始化输入和输出 scatter-gather 列表的计数器。
     out_num = in_num = elem_entries = 0;
 
     max = vq->vring.num;
 
+    // 检查在用描述符数量是否超过队列大小，防止队列溢出。
     if (vq->inuse >= vq->vring.num) {
         virtio_error(vdev, "Virtqueue size exceeded");
         goto done;
     }
 
+    // 从可用环中获取下一个描述符链的头部索引 (head)，并递增 last_avail_idx。
     if (!virtqueue_get_head(vq, vq->last_avail_idx++, &head)) {
         goto done;
     }
 
+    // 如果支持 VIRTIO_RING_F_EVENT_IDX，则更新 guest 的可用事件。
     if (virtio_vdev_has_feature(vdev, VIRTIO_RING_F_EVENT_IDX)) {
         vring_set_avail_event(vq, vq->last_avail_idx);
     }
 
+    // 开始遍历描述符链
     i = head;
 
     caches = vring_get_region_caches(vq);
@@ -1746,7 +1784,9 @@ static void *virtqueue_split_pop(VirtQueue *vq, size_t sz)
     }
 
     desc_cache = &caches->desc;
+    // 读取描述符链的第一个描述符。
     vring_split_desc_read(vdev, &desc, desc_cache, i);
+    // 检查是否是间接描述符表
     if (desc.flags & VRING_DESC_F_INDIRECT) {
         if (!desc.len || (desc.len % sizeof(VRingDesc))) {
             virtio_error(vdev, "Invalid size for indirect buffer table");
@@ -1755,6 +1795,7 @@ static void *virtqueue_split_pop(VirtQueue *vq, size_t sz)
         virtio_check_indirect_feature(vdev);
 
         /* loop over the indirect descriptor table */
+        // 映射间接描述符表本身
         len = address_space_cache_init(&indirect_desc_cache, vdev->dma_as,
                                        desc.addr, desc.len, false);
         desc_cache = &indirect_desc_cache;
@@ -1763,21 +1804,25 @@ static void *virtqueue_split_pop(VirtQueue *vq, size_t sz)
             goto done;
         }
 
+        // 遍历间接描述符表中的每一个描述符
         max = desc.len / sizeof(VRingDesc);
         i = 0;
         vring_split_desc_read(vdev, &desc, desc_cache, i);
     }
 
     /* Collect all the descriptors */
+    // 收集所有描述符，无论是直接的还是间接的
     do {
         bool map_ok;
 
+        // 根据 VRING_DESC_F_WRITE 标志判断是输入（设备可写）还是输出（设备只读）缓冲区
         if (desc.flags & VRING_DESC_F_WRITE) {
             map_ok = virtqueue_map_desc(vdev, &in_num, addr + out_num,
                                         iov + out_num,
                                         VIRTQUEUE_MAX_SIZE - out_num, true,
                                         desc.addr, desc.len);
         } else {
+            // 输出描述符必须在输入描述符之前
             if (in_num) {
                 virtio_error(vdev, "Incorrect order for descriptors");
                 goto err_undo_map;
@@ -1791,11 +1836,13 @@ static void *virtqueue_split_pop(VirtQueue *vq, size_t sz)
         }
 
         /* If we've got too many, that implies a descriptor loop. */
+        // 检查描述符链是否过长，防止循环引用。
         if (++elem_entries > max) {
             virtio_error(vdev, "Looped descriptor");
             goto err_undo_map;
         }
 
+        // 读取下一个链接的描述符
         rc = virtqueue_split_read_next_desc(vdev, &desc, desc_cache, max);
     } while (rc == VIRTQUEUE_READ_DESC_MORE);
 
@@ -1804,9 +1851,10 @@ static void *virtqueue_split_pop(VirtQueue *vq, size_t sz)
     }
 
     /* Now copy what we have collected and mapped */
+    // 分配一个 VirtQueueElement，并将收集到的缓冲区信息复制进去。
     elem = virtqueue_alloc_element(sz, out_num, in_num);
     elem->index = head;
-    elem->ndescs = 1;
+    elem->ndescs = 1; // 对于 split queue，一个 pop 操作对应一个 avail ring 条目，所以 ndescs 总是 1
     for (i = 0; i < out_num; i++) {
         elem->out_addr[i] = addr[i];
         elem->out_sg[i] = iov[i];
@@ -1816,6 +1864,7 @@ static void *virtqueue_split_pop(VirtQueue *vq, size_t sz)
         elem->in_sg[i] = iov[out_num + i];
     }
 
+    // 如果支持 VIRTIO_F_IN_ORDER，需要记录元素信息以备有序 flush。
     if (virtio_vdev_has_feature(vdev, VIRTIO_F_IN_ORDER)) {
         idx = (vq->last_avail_idx - 1) % vq->vring.num;
         vq->used_elems[idx].index = elem->index;
@@ -1829,13 +1878,26 @@ static void *virtqueue_split_pop(VirtQueue *vq, size_t sz)
 done:
     address_space_cache_destroy(&indirect_desc_cache);
 
-    return elem;
+    return elem; // 成功，返回填充好的 element
 
 err_undo_map:
+    // 如果在映射过程中出错，需要撤销已经映射的 iovec 条目
     virtqueue_undo_map_desc(out_num, in_num, iov);
     goto done;
 }
 
+/*
+ * virtqueue_packed_pop - 从 packed virtqueue 中弹出一个可用的描述符链
+ *
+ * 这个函数实现了从 "packed" (紧凑式) virtqueue 中获取一个描述符链。
+ * Packed virtqueue 是一种优化的 virtqueue 格式，旨在通过将描述符环、可用环和已用环
+ * 合并为一个统一的结构来提高性能和减少缓存未命中。
+ *
+ * @vq: 指向要操作的 VirtQueue。
+ * @sz: VirtQueueElement 的大小，包含了 iovec 数组的预留空间。
+ *
+ * @return: 成功则返回一个填充好的 VirtQueueElement 指针，如果队列中没有可用的描述符，则返回 NULL。
+ */
 static void *virtqueue_packed_pop(VirtQueue *vq, size_t sz)
 {
     unsigned int i, max;
@@ -1855,15 +1917,18 @@ static void *virtqueue_packed_pop(VirtQueue *vq, size_t sz)
     address_space_cache_init_empty(&indirect_desc_cache);
 
     RCU_READ_LOCK_GUARD();
+    // 检查 packed virtqueue 是否为空
     if (virtio_queue_packed_empty_rcu(vq)) {
         goto done;
     }
 
     /* When we start there are none of either input nor output. */
+    // 初始化输入和输出描述符计数
     out_num = in_num = elem_entries = 0;
 
     max = vq->vring.num;
 
+    // 检查在用描述符数量是否超过队列大小
     if (vq->inuse >= vq->vring.num) {
         virtio_error(vdev, "Virtqueue size exceeded");
         goto done;
@@ -1883,8 +1948,10 @@ static void *virtqueue_packed_pop(VirtQueue *vq, size_t sz)
     }
 
     desc_cache = &caches->desc;
+    // 读取 packed 描述符
     vring_packed_desc_read(vdev, &desc, desc_cache, i, true);
     id = desc.id;
+    // 检查是否是间接描述符表
     if (desc.flags & VRING_DESC_F_INDIRECT) {
         if (desc.len % sizeof(VRingPackedDesc)) {
             virtio_error(vdev, "Invalid size for indirect buffer table");
@@ -1893,6 +1960,7 @@ static void *virtqueue_packed_pop(VirtQueue *vq, size_t sz)
         virtio_check_indirect_feature(vdev);
 
         /* loop over the indirect descriptor table */
+        // 映射间接描述符表
         len = address_space_cache_init(&indirect_desc_cache, vdev->dma_as,
                                        desc.addr, desc.len, false);
         desc_cache = &indirect_desc_cache;
@@ -1907,10 +1975,12 @@ static void *virtqueue_packed_pop(VirtQueue *vq, size_t sz)
     }
 
     /* Collect all the descriptors */
+    // 收集所有描述符
     do {
         bool map_ok;
 
         if (desc.flags & VRING_DESC_F_WRITE) {
+            // 映射设备可写的缓冲区 (in)
             map_ok = virtqueue_map_desc(vdev, &in_num, addr + out_num,
                                         iov + out_num,
                                         VIRTQUEUE_MAX_SIZE - out_num, true,
@@ -1920,6 +1990,7 @@ static void *virtqueue_packed_pop(VirtQueue *vq, size_t sz)
                 virtio_error(vdev, "Incorrect order for descriptors");
                 goto err_undo_map;
             }
+            // 映射设备只读的缓冲区 (out)
             map_ok = virtqueue_map_desc(vdev, &out_num, addr, iov,
                                         VIRTQUEUE_MAX_SIZE, false,
                                         desc.addr, desc.len);
@@ -1929,11 +2000,13 @@ static void *virtqueue_packed_pop(VirtQueue *vq, size_t sz)
         }
 
         /* If we've got too many, that implies a descriptor loop. */
+        // 如果描述符数量过多，意味着存在描述符循环
         if (++elem_entries > max) {
             virtio_error(vdev, "Looped descriptor");
             goto err_undo_map;
         }
 
+        // 读取下一个描述符
         rc = virtqueue_packed_read_next_desc(vq, &desc, desc_cache, max, &i,
                                              desc_cache ==
                                              &indirect_desc_cache);
@@ -1941,10 +2014,12 @@ static void *virtqueue_packed_pop(VirtQueue *vq, size_t sz)
 
     if (desc_cache != &indirect_desc_cache) {
         /* Buffer ID is included in the last descriptor in the list. */
+        // 缓冲区 ID 包含在列表的最后一个描述符中
         id = desc.id;
     }
 
     /* Now copy what we have collected and mapped */
+    // 现在复制我们收集和映射的内容
     elem = virtqueue_alloc_element(sz, out_num, in_num);
     for (i = 0; i < out_num; i++) {
         elem->out_addr[i] = addr[i];
@@ -1964,6 +2039,7 @@ static void *virtqueue_packed_pop(VirtQueue *vq, size_t sz)
         vq->used_elems[vq->last_avail_idx].ndescs = elem->ndescs;
     }
 
+    // 更新 Host 的可用索引和在用描述符计数
     vq->last_avail_idx += elem->ndescs;
     vq->inuse += elem->ndescs;
 
@@ -1982,10 +2058,41 @@ done:
     return elem;
 
 err_undo_map:
+    // 映射出错，撤销已映射的 iovec
     virtqueue_undo_map_desc(out_num, in_num, iov);
     goto done;
 }
 
+/*
+ * virtqueue_pop - 从 virtqueue 中弹出一个可用的描述符链
+ *
+ * 这是一个高级封装函数，用于从 virtqueue 中获取下一个可用的描述符链。
+ * 它会检查 virtqueue 的类型（是传统的 split queue 还是优化的 packed queue），
+ * 然后调用相应的底层函数 (`virtqueue_split_pop` 或 `virtqueue_packed_pop`) 来执行实际的操作。
+ *
+ * @vq: 指向要操作的 VirtQueue。
+ * @sz: VirtQueueElement 的大小，这个大小必须足够容纳 `VirtQueueElement` 结构本身
+ *      以及其后跟随的 `in_sg` 和 `out_sg` iovec 数组。
+ *      通常使用 `sizeof(VirtQueueElement) + sizeof(struct iovec) * VIRTQUEUE_MAX_SIZE` 来计算。
+ *
+ * @return: 如果成功从队列中获取并映射了一个描述符链，则返回一个指向填充好的
+ *          `VirtQueueElement` 结构的指针。如果队列为空，则返回 NULL。
+ */
+/*
+ * virtqueue_pop - 从 virtqueue 中弹出一个可用的描述符链
+ *
+ * 这是一个高级封装函数，用于从 virtqueue 中获取下一个可用的描述符链。
+ * 它会检查 virtqueue 的类型（是传统的 split queue 还是优化的 packed queue），
+ * 然后调用相应的底层函数 (`virtqueue_split_pop` 或 `virtqueue_packed_pop`) 来执行实际的操作。
+ *
+ * @vq: 指向要操作的 VirtQueue。
+ * @sz: VirtQueueElement 的大小，这个大小必须足够容纳 `VirtQueueElement` 结构本身
+ *      以及其后跟随的 `in_sg` 和 `out_sg` iovec 数组。
+ *      通常使用 `sizeof(VirtQueueElement) + sizeof(struct iovec) * VIRTQUEUE_MAX_SIZE` 来计算。
+ *
+ * @return: 如果成功从队列中获取并映射了一个描述符链，则返回一个指向填充好的
+ *          `VirtQueueElement` 结构的指针。如果队列为空，则返回 NULL。
+ */
 void *virtqueue_pop(VirtQueue *vq, size_t sz)
 {
     if (virtio_device_disabled(vq->vdev)) {

@@ -652,10 +652,12 @@ int qemu_get_thread_id(void);
  */
 int qemu_kill_thread(int tid, int sig);
 
+// scatter-gather list
+// 描述Guest内存中的设备缓冲区
 #ifndef CONFIG_IOVEC
 struct iovec {
-    void *iov_base;
-    size_t iov_len;
+    void *iov_base; // 指向缓冲区的指针
+    size_t iov_len; // 缓冲区的长度
 };
 /*
  * Use the same value as Linux for now.

@@ -2653,77 +2653,119 @@ static void virtio_net_tx_complete(NetClientState *nc, ssize_t len)
     }
 }
 
-/* TX */
+/*
+ * virtio_net_flush_tx - 从发送队列(tx_vq)中取出数据包并发送
+ *
+ * 这个函数是 virtio-net 后端处理 Guest 发送数据包的核心。
+ * 它会循环地从发送 virtqueue 中取出 Guest 准备好的数据包描述符，
+ * 然后将这些描述符指向的 Guest 内存中的数据包内容发送到 QEMU 配置的网络后端（如 TAP 设备）。
+ *
+ * @q: 指向 VirtIONetQueue 结构，包含了要处理的发送队列 (tx_vq) 等信息。
+ *
+ * 返回值:
+ *  - 成功发送的数据包数量。
+ *  - 如果发送正忙 (asynchronous send in progress)，返回 -EBUSY。
+ *  - 如果遇到无效的描述符，返回 -EINVAL。
+ */
 static int32_t virtio_net_flush_tx(VirtIONetQueue *q)
 {
+    // 获取相关的设备和队列信息
     VirtIONet *n = q->n;
     VirtIODevice *vdev = VIRTIO_DEVICE(n);
     VirtQueueElement *elem;
-    int32_t num_packets = 0;
+    int32_t num_packets = 0; // 记录本次调用成功发送的数据包数量
     int queue_index = vq2q(virtio_get_queue_index(q->tx_vq));
+
+    // 检查 Guest 驱动是否已经准备就绪。如果驱动还未设置 DRIVER_OK 状态，
+    // 说明设备还不能工作，直接返回。
     if (!(vdev->status & VIRTIO_CONFIG_S_DRIVER_OK)) {
         return num_packets;
     }
 
+    // 检查是否有正在进行的异步发送操作。
+    // 如果 q->async_tx.elem 不为 NULL，说明上一个数据包的异步发送还未完成。
+    // 此时不能发送新的数据包，需要等待 `virtio_net_tx_complete` 回调。
+    // 同时禁用 virtqueue 通知，避免不必要的重复触发。
     if (q->async_tx.elem) {
         virtio_queue_set_notification(q->tx_vq, 0);
         return num_packets;
     }
 
+    // 循环处理发送队列中的所有可用数据包
     for (;;) {
         ssize_t ret;
         unsigned int out_num;
+        // sg: 用于存储处理后的 scatter-gather 列表
+        // sg2: 用于处理需要字节序转换的 virtio-net-header
+        // out_sg: 指向最终要发送的 scatter-gather 列表
         struct iovec sg[VIRTQUEUE_MAX_SIZE], sg2[VIRTQUEUE_MAX_SIZE + 1], *out_sg;
         struct virtio_net_hdr vhdr;
 
+        // 从发送队列中弹出一个“元素”(elem)。
+        // 这个元素代表了一个完整的数据包，可能由一个或多个描述符（scatter-gather entry）组成。
+        // 这些描述符指向 Guest 物理内存中的数据。
         elem = virtqueue_pop(q->tx_vq, sizeof(VirtQueueElement));
         if (!elem) {
+            // 如果队列为空，说明没有更多的数据包需要发送，跳出循环。
             break;
         }
 
+        // `elem->out_sg` 是一个 iovec 数组，包含了指向 Guest 内存的数据缓冲区地址和长度。
+        // 这就是模拟 DMA 读取操作的数据源。
         out_num = elem->out_num;
         out_sg = elem->out_sg;
         if (out_num < 1) {
+            // 每个数据包至少要有一个描述符（用于 virtio-net-header）。
             virtio_error(vdev, "virtio-net header not in first element");
-            goto detach;
+            goto detach; // 出错处理，分离元素
         }
 
+        // 如果 Guest 和 Host 的字节序不同，需要对 virtio-net-header 进行字节序转换。
         if (n->needs_vnet_hdr_swap) {
+            // 从 Guest 内存中拷贝出 virtio-net-header
             if (iov_to_buf(out_sg, out_num, 0, &vhdr, sizeof(vhdr)) <
                 sizeof(vhdr)) {
                 virtio_error(vdev, "virtio-net header incorrect");
                 goto detach;
             }
+            // 进行字节序转换
             virtio_net_hdr_swap(vdev, &vhdr);
+            // 构建一个新的 scatter-gather 列表 `sg2`：
+            // 第一个元素是转换后的 header，后续元素是原始的数据包 payload。
             sg2[0].iov_base = &vhdr;
             sg2[0].iov_len = sizeof(vhdr);
             out_num = iov_copy(&sg2[1], ARRAY_SIZE(sg2) - 1, out_sg, out_num,
                                sizeof(vhdr), -1);
             if (out_num == VIRTQUEUE_MAX_SIZE) {
+                // 如果数据包片段太多，无法处理，则丢弃该包。
                 goto drop;
             }
             out_num += 1;
-            out_sg = sg2;
+            out_sg = sg2; // 让 out_sg 指向新的列表
         }
         /*
          * If host wants to see the guest header as is, we can
          * pass it on unchanged. Otherwise, copy just the parts
          * that host is interested in.
          */
+        // 根据 Host 的需要，可能需要调整 virtio-net-header 的长度。
+        // 例如，如果 Host 不需要完整的 header 信息。
         assert(n->host_hdr_len <= n->guest_hdr_len);
         if (n->host_hdr_len != n->guest_hdr_len) {
             if (iov_size(out_sg, out_num) < n->guest_hdr_len) {
                 virtio_error(vdev, "virtio-net header is invalid");
                 goto detach;
             }
+            // 拷贝 Host 需要的 header 部分
             unsigned sg_num = iov_copy(sg, ARRAY_SIZE(sg),
                                        out_sg, out_num,
                                        0, n->host_hdr_len);
+            // 拷贝数据包的 payload 部分 (跳过 Guest 的 header)
             sg_num += iov_copy(sg + sg_num, ARRAY_SIZE(sg) - sg_num,
                              out_sg, out_num,
                              n->guest_hdr_len, -1);
             out_num = sg_num;
-            out_sg = sg;
+            out_sg = sg; // 让 out_sg 指向新的列表
 
             if (out_num < 1) {
                 virtio_error(vdev, "virtio-net nothing to send");
@@ -2731,29 +2773,45 @@ static int32_t virtio_net_flush_tx(VirtIONetQueue *q)
             }
         }
 
+        // 核心发送函数：异步发送数据包。
+        // `qemu_sendv_packet_async` 会读取 `out_sg` 指向的 Guest 内存中的数据，
+        // 并将其发送到网络后端（如 TAP 设备）。
+        // `virtio_net_tx_complete` 是发送完成后的回调函数。
         ret = qemu_sendv_packet_async(qemu_get_subqueue(n->nic, queue_index),
                                       out_sg, out_num, virtio_net_tx_complete);
         if (ret == 0) {
+            // 如果 `qemu_sendv_packet_async` 返回 0，表示发送请求已接受但尚未完成（正忙）。
+            // 禁用 virtqueue 通知，因为我们正在等待 `virtio_net_tx_complete` 回调。
             virtio_queue_set_notification(q->tx_vq, 0);
+            // 保存当前正在处理的元素，以便在回调函数中释放它。
             q->async_tx.elem = elem;
+            // 返回 -EBUSY，通知上层调用者当前正忙。
             return -EBUSY;
         }
 
 drop:
+        // 如果数据包被丢弃 (goto drop) 或发送成功 (ret != 0)，
+        // 将用过的描述符归还给 Guest。
         virtqueue_push(q->tx_vq, elem, 0);
+        // 通知 Guest，让它可以回收和重用这些描述符。
         virtio_notify(vdev, q->tx_vq);
         g_free(elem);
 
+        // 检查是否达到了本次调用允许发送的最大数据包数量 (tx_burst)。
+        // 这是为了防止一次性处理过多数据包导致 QEMU 卡顿。
         if (++num_packets >= n->tx_burst) {
             break;
         }
     }
-    return num_packets;
+    return num_packets; // 返回成功发送的数据包数量
 
 detach:
+    // 错误处理：如果遇到一个无效的描述符，我们不能简单地将其 push 回去，
+    // 因为 Guest 可能不会正确处理它。
+    // `virtqueue_detach_element` 会处理这种情况。
     virtqueue_detach_element(q->tx_vq, elem, 0);
     g_free(elem);
-    return -EINVAL;
+    return -EINVAL; // 返回错误码
 }
 
 static void virtio_net_tx_timer(void *opaque);
