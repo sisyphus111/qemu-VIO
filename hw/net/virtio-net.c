@@ -1918,6 +1918,19 @@ static ssize_t virtio_net_receive_rcu(NetClientState *nc, const uint8_t *buf,
         }
 
         sg = elem->in_sg;
+        /* 调试：打印本次 RX DMA 写入所映射到的 GPA->HVA 区间 */
+        {
+            unsigned int k;
+            int rx_qindex = vq2q(virtio_get_queue_index(q->rx_vq));
+            for (k = 0; k < elem->in_num; k++) {
+                fprintf(stderr,
+                        "[virtio-net][RX][q=%d] GPA=0x%016" PRIx64 " HVA=%p len=%zu\n",
+                        rx_qindex,
+                        (uint64_t)elem->in_addr[k],
+                        sg[k].iov_base,
+                        (size_t)sg[k].iov_len);
+            }
+        }
         if (i == 0) {
             assert(offset == 0);
             if (n->mergeable_rx_bufs) {
@@ -2718,6 +2731,19 @@ static int32_t virtio_net_flush_tx(VirtIONetQueue *q)
             // 每个数据包至少要有一个描述符（用于 virtio-net-header）。
             virtio_error(vdev, "virtio-net header not in first element");
             goto detach; // 出错处理，分离元素
+        }
+
+        /* 调试：打印本次 TX DMA 读取所映射到的 GPA->HVA 区间 */
+        {
+            unsigned int k;
+            for (k = 0; k < out_num; k++) {
+                fprintf(stderr,
+                        "[virtio-net][TX][q=%d] GPA=0x%016" PRIx64 " HVA=%p len=%zu\n",
+                        queue_index,
+                        (uint64_t)elem->out_addr[k],
+                        out_sg[k].iov_base,
+                        (size_t)out_sg[k].iov_len);
+            }
         }
 
         // 如果 Guest 和 Host 的字节序不同，需要对 virtio-net-header 进行字节序转换。
