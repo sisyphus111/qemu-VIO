@@ -32,6 +32,7 @@
 #include "hw/virtio/virtio-access.h"
 #include "system/dma.h"
 #include "system/runstate.h"
+#include "qemu/timer.h"
 #include "virtio-qmp.h"
 
 #include "standard-headers/linux/virtio_ids.h"
@@ -116,6 +117,58 @@ typedef struct VRingPackedDescEvent {
     uint16_t off_wrap;
     uint16_t flags;
 } VRingPackedDescEvent ;
+
+/*
+ * 简单的 Virtio DMA 日志设施：
+ *
+ * - 将每次 DMA 映射得到的 GPA/HVA/长度，以及“轻触”该 HVA 的时间戳
+ *   记录到一个独立的日志文件中；
+ * - 通过读取 HVA 首字节来“轻触”对应页，从而在必要时触发宿主的缺页
+ *   处理逻辑，便于观测页换入的时间。
+ */
+
+#define VIRTIO_DMA_LOG_PATH "/tmp/virtio_dma.log"
+
+static FILE *virtio_dma_log_file;
+
+static void virtio_dma_log_touch(VirtIODevice *vdev, bool is_write,
+                                 hwaddr gpa, void *hva, hwaddr len)
+{
+    int64_t now_ns;
+    const char *dir_str;
+    const char *name;
+    volatile uint8_t touch;
+
+    if (!hva || !len) {
+        return;
+    }
+
+    /*
+     * 轻触一次 HVA：读取首字节即可触发宿主在必要时将对应页换入内存。
+     * 使用 volatile 防止编译器优化掉这个读取操作。
+     */
+    touch = *(volatile uint8_t *)hva;
+    (void)touch;
+
+    /* 初始化日志文件（仅在第一次调用时打开） */
+    if (unlikely(!virtio_dma_log_file)) {
+        virtio_dma_log_file = fopen(VIRTIO_DMA_LOG_PATH, "a");
+        if (!virtio_dma_log_file) {
+            return;
+        }
+        /* 行缓冲，便于实时观察 */
+        setvbuf(virtio_dma_log_file, NULL, _IOLBF, 0);
+    }
+
+    now_ns = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+    dir_str = is_write ? "FROM_DEVICE" : "TO_DEVICE";
+    name = vdev && vdev->name ? vdev->name : "<virtio>";
+
+    fprintf(virtio_dma_log_file,
+            "[virtio-dma] dir=%s dev=%s gpa=0x%016" PRIx64
+            " hva=%p len=%" PRIu64 " time_ns=%" PRId64 "\n",
+            dir_str, name, (uint64_t)gpa, hva, (uint64_t)len, now_ns);
+}
 
 struct VirtQueue
 {
@@ -1627,6 +1680,13 @@ static bool virtqueue_map_desc(VirtIODevice *vdev, unsigned int *p_num_sg,
         iov[num_sg].iov_len = len;
         addr[num_sg] = pa;
 
+        /*
+         * 在完成一次 DMA 映射后，对应的 HVA 区域进行一次“轻触”并记录日志，
+         * 以便观测 GPA↔HVA 映射关系及潜在的页换入时间。
+         */
+        virtio_dma_log_touch(vdev, is_write, addr[num_sg],
+                             iov[num_sg].iov_base, iov[num_sg].iov_len);
+
         sz -= len;
         pa += len;
         num_sg++;
@@ -1677,6 +1737,13 @@ static void virtqueue_map_iovec(VirtIODevice *vdev, struct iovec *sg,
             error_report("virtio: unexpected memory split");
             exit(1);
         }
+
+        /*
+         * 同样在通过 iovec 方式映射 MMIO/设备内存时，对 GPA 对应的 HVA
+         * 进行一次轻触并记录日志。
+         */
+        virtio_dma_log_touch(vdev, is_write, addr[i],
+                             sg[i].iov_base, sg[i].iov_len);
     }
 }
 
