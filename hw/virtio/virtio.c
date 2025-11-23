@@ -134,7 +134,7 @@ static FILE *virtio_dma_log_file;
 static void virtio_dma_log_touch(VirtIODevice *vdev, bool is_write,
                                  hwaddr gpa, void *hva, hwaddr len)
 {
-    int64_t now_ns;
+    int64_t start_ns, end_ns, delta_ns;
     const char *dir_str;
     const char *name;
     volatile uint8_t touch;
@@ -147,8 +147,11 @@ static void virtio_dma_log_touch(VirtIODevice *vdev, bool is_write,
      * 轻触一次 HVA：读取首字节即可触发宿主在必要时将对应页换入内存。
      * 使用 volatile 防止编译器优化掉这个读取操作。
      */
+    start_ns = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
     touch = *(volatile uint8_t *)hva;
     (void)touch;
+    end_ns = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+    delta_ns = end_ns - start_ns;
 
     /* 初始化日志文件（仅在第一次调用时打开） */
     if (unlikely(!virtio_dma_log_file)) {
@@ -160,14 +163,13 @@ static void virtio_dma_log_touch(VirtIODevice *vdev, bool is_write,
         setvbuf(virtio_dma_log_file, NULL, _IOLBF, 0);
     }
 
-    now_ns = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
     dir_str = is_write ? "FROM_DEVICE" : "TO_DEVICE";
     name = vdev && vdev->name ? vdev->name : "<virtio>";
 
     fprintf(virtio_dma_log_file,
             "[virtio-dma] dir=%s dev=%s gpa=0x%016" PRIx64
-            " hva=%p len=%" PRIu64 " time_ns=%" PRId64 "\n",
-            dir_str, name, (uint64_t)gpa, hva, (uint64_t)len, now_ns);
+            " hva=%p len=%" PRIu64 " touch_ns=%" PRId64 "\n",
+            dir_str, name, (uint64_t)gpa, hva, (uint64_t)len, delta_ns);
 }
 
 struct VirtQueue
