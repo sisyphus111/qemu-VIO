@@ -135,6 +135,7 @@ static void virtio_dma_log_touch(VirtIODevice *vdev, bool is_write,
                                  hwaddr gpa, void *hva, hwaddr len)
 {
     int64_t start_ns, end_ns, delta_ns;
+    uintptr_t base, end, p, page_size;
     const char *dir_str;
     const char *name;
     volatile uint8_t touch;
@@ -144,12 +145,22 @@ static void virtio_dma_log_touch(VirtIODevice *vdev, bool is_write,
     }
 
     /*
-     * 轻触一次 HVA：读取首字节即可触发宿主在必要时将对应页换入内存。
-     * 使用 volatile 防止编译器优化掉这个读取操作。
+     * 轻触一次 DMA 覆盖区域中的“所有页”：以宿主真实页大小为步长，对
+     * [hva, hva + len) 覆盖到的每一页读取一个字节。这可以在必要时触发
+     * 每一页的缺页处理，从而使 touch_ns 更接近“整段 DMA 区域已被换入”
+     * 的时间。
      */
+    page_size = qemu_real_host_page_size();
+    base = (uintptr_t)hva;
+    end  = base + len;
+    /* 向下对齐到页边界，确保覆盖到起始页 */
+    p = base & ~(page_size - 1);
+
     start_ns = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
-    touch = *(volatile uint8_t *)hva;
-    (void)touch;
+    for (; p < end; p += page_size) {
+        touch = *(volatile uint8_t *)p;
+        (void)touch;
+    }
     end_ns = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
     delta_ns = end_ns - start_ns;
 
