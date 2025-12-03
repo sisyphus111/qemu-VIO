@@ -267,7 +267,8 @@ qtests_aarch64 = \
   ['arm-cpu-features',
    'numa-test',
    'boot-serial-test',
-   'migration-test']
+   'migration-test',
+  ]
 
 qtests_s390x = \
   qtests_filter + \
@@ -319,6 +320,7 @@ qos_test_ss.add(
   'igb-test.c',
   'ufs-test.c',
   'riscv-iommu-test.c',
+  'virtio-dma-bench.c',
 )
 
 if config_all_devices.has_key('CONFIG_VIRTIO_SERIAL')
